@@ -1,0 +1,297 @@
+# Load YAML configuration
+import yaml
+import pandas as pd
+import glob
+
+# (Assuming config is defined/loaded earlier)
+samples = pd.read_csv(config["sample_file"], sep="\t", header=None, names=["sample_id", "library_id", "strandness", "fq"])
+databases = pd.read_csv(config["database_file"], sep="\t", header=None, names=["db_name", "db_path"])
+
+TMP_DIR = config["tmp_dir"]  ## path to location for temporary files
+METADMG_CPP = config["metaDMG-cpp"]
+NAMES = config["names"]
+NODES = config["nodes"]
+ACC2TAX = config["acc2tax"]
+
+# Unique lists
+sample_libraries = samples.groupby(["sample_id", "library_id"])["fq"].apply(list).reset_index()
+unique_samples = samples["sample_id"].unique()
+
+# Determine strandness per sample
+def get_strandness(sample):
+    strand_types = samples[samples["sample_id"] == sample]["strandness"].unique()
+    if len(strand_types) == 1:
+        return strand_types[0]  # Either "ds" or "ss"
+    return "mix"
+
+def get_library_strandness(sample, library):
+    strand_types = samples[(samples["sample_id"] == sample) & (samples["library_id"] == library)]["strandness"].unique()
+    if len(strand_types) == 1:
+        return strand_types[0]  # Either "ds" or "ss"
+    return "mix"
+
+# Rule all: using unique combinations from sample_libraries
+rule all:
+    input:
+        expand("holi_aggregate/{sample}.bam.stat.gz",sample=unique_samples),
+#       expand("merged_fq/{sample}_{library}.final.fq.gz",
+#              zip,
+#              sample=sample_libraries["sample_id"].tolist(),
+#              library=sample_libraries["library_id"].tolist())
+
+# Merge FASTQ files by sample and library
+rule merge_fastq:
+    input:
+        lambda wildcards: sample_libraries[(sample_libraries["sample_id"] == wildcards.sample) &
+            				   (sample_libraries["library_id"] == wildcards.library)]["fq"].values[0]
+    output:
+        "merged_fq/{sample}_{library}.fq.gz"
+    log:
+        "logs/merge_fq/{sample}_{library}.log"
+    benchmark:
+        "benchmarks/merge_fq/{sample}_{library}.txt"
+    shell:
+        "(cat {input} > {output}) 2> {log}"
+
+# Align each FASTQ file to gtdk_hires database
+rule mapping_gtdb:
+    input:
+        fq="merged_fq/{sample}_{library}.fq.gz"
+    output:
+        dedup="mapped/{sample}_{library}.gtdb_hires.bam",
+        unmap_fq="unmapped/{sample}_{library}.unmapped.fq.gz"
+    threads: 10
+    params:
+       index=config["gtdb_db"],
+       map_opts="-k 250 --np 1 --mp '1,1' --rdg '0,1' --rfg '0,1' --score-min 'L,0,-0.05' --very-sensitive --no-unal"
+    log:
+       "logs/mapping/{sample}_{library}.gtdb_hires_mapped.log"
+    benchmark:
+       "benchmarks/mapping/{sample}_{library}.gtdb_hires_mapped.txt"
+    shell:
+       """
+       (bowtie2 -x {params.index} -U {input} {params.map_opts} --threads {threads} --un-gz {output.unmap_fq} | samtools view -b --threads {threads} | samtools sort --threads {threads} | samtools rmdup -s -  {output.dedup}) 2> {log}
+       """
+
+# Filter alignment
+rule filterbam_gtdb:
+    input:
+        bam="mapped/{sample}_{library}.gtdb_hires.bam"
+    output:
+        reassign="reassign/{sample}_{library}.gtdb_hires.reassign.bam",
+        filter="filtered/{sample}_{library}.gtdb_hires.filtered.bam",
+        stats="filtered/{sample}_{library}.gtdb_hires.stats.tsv.gz",
+        stats_filtered="filtered/{sample}_{library}.gtdb_hires.stats-filtered.tsv.gz"
+    threads: 10
+    log:
+        "logs/refine/{sample}_{library}.gtdb_hires.log"
+    benchmark:
+        "benchmarks/refine/{sample}_{library}.gtdb_hires.txt"
+    shell:
+       """
+       (filterBAM reassign --bam {input.bam} --threads {threads} --iters 0 --min-read-ani 92 -M 100G -m 50G -n 3 --out-bam {output.reassign}) 2> {log}
+       (filterBAM filter --tmp-dir {TMP_DIR} --bam {output.reassign} --bam-filtered {output.filter} --stats {output.stats} --stats-filtered {output.stats_filtered} --threads {threads} --min-read-ani 92 --min-normalized-entropy 0.6 -m 50G -n 10 -a 95 -N ) 2>> {log}
+       """
+
+# Damage detection
+rule metadamge_gtdb:
+    input:
+       bam="filtered/{sample}_{library}.gtdb_hires.filtered.bam",
+    output:
+       bdamge="lca/{sample}_{library}.gtdb_hires.bam.bdamage.gz",
+       lca="lca/{sample}_{library}.gtdb_hires.bam.lca.gz",
+       stat="lca/{sample}_{library}.gtdb_hires.bam.stat.gz",
+       wlca="lca/{sample}_{library}.gtdb_hires.bam.rlens.gz",
+       dfit="dfit/{sample}_{library}.gtdb_hires.bam.dfit.gz",
+       agg_stat="aggregate/{sample}_{library}.gtdb_hires.bam.stat.gz"
+    params:
+       names=config["gtdb_names"],
+       nodes=config["gtdb_nodes"],
+       acc2tax=config["gtdb_acc2tax"],
+       prefix="{sample}_{library}.gtdb_hires.bam",
+       strandness=lambda wildcards: get_library_strandness(wildcards.sample, wildcards.library),
+    threads: 10
+    log:
+       "logs/metadmg/{sample}_{library}.gtdb_hires.log"
+    benchmark:
+       "benchmarks/metadmg/{sample}_{library}.gtdb_hires.txt"
+    shell:
+        """
+        ({METADMG_CPP}/metaDMG-cpp lca --names {params.names} --nodes {params.nodes} --acc2tax {params.acc2tax} --sim_score_low 0.95 --sim_score_high 1.0 --how_many 30 --weight_type 1 --threads {threads} --bam {input.bam} --out_prefix lca/{params.prefix} --fix_ncbi 0) 2>> {log}
+        ({METADMG_CPP}/metaDMG-cpp dfit {output.bdamge} --names {params.names} --nodes {params.nodes} --showfits 2  --lib {params.strandness} --out dfit/{params.prefix} ) 2>> {log}
+        ({METADMG_CPP}/metaDMG-cpp aggregate {output.bdamge} --lcastat {output.stat} --names {params.names} --nodes {params.nodes} --out aggregate/{params.prefix} ) 2>> {log}
+        """
+
+# Extract eukaryotes mapped reads
+#            ln -sf $(pwd)/{input.unmap_fq} {output.fq_gz}
+rule extract_reads:
+    input:
+        lca="lca/{sample}_{library}.gtdb_hires.bam.lca.gz",
+        unmap_fq="unmapped/{sample}_{library}.unmapped.fq.gz",
+        merge="merged_fq/{sample}_{library}.fq.gz"
+    output:
+        header="lca/{sample}_{library}.gtdb_hires.header.txt",
+        fq_gz="merged_fq/{sample}_{library}.final.fq.gz"
+    log:
+        "logs/fq/{sample}_{library}.gtdb_hires.log"
+    benchmark:
+        "benchmarks/fq/{sample}_{library}.gtdb_hires.txt"
+    shell:
+        """
+        set -euo pipefail
+
+        echo "Extracting Eukaryotic read IDs from: {input.lca}" > {log}
+        zcat {input.lca} | grep "Eukaryota" | cut -f 1 > {output.header} || :
+
+        nreads=$(wc -l < {output.header})
+        echo "Eukaryotic read count: $nreads" >> {log}
+
+        if [ -s {output.header} ]; then
+            echo "Header is not empty. Extracting matching reads..." >> {log}
+            seqtk subseq {input.merge} {output.header} | gzip -c > {output.fq_gz}
+            cat {input.unmap_fq} >> {output.fq_gz}
+        else
+            echo "Header is empty. No matching reads found. Using unmapped reads only." >> {log}
+#            cp {input.unmap_fq} {output.fq_gz}
+            ln -sf $(pwd)/{input.unmap_fq} {output.fq_gz}
+        fi
+        """
+#Align each FASTQ file to each Bowtie2 database
+rule mapping:
+    input:
+        fq="merged_fq/{sample}_{library}.final.fq.gz"
+    output:
+        dedup="holi_mapped/{sample}_{library}.{db}.bam",
+        comp="holi_mapped/{sample}_{library}.{db}.comp.bam"
+    params:
+        index=lambda wildcards: databases[databases["db_name"] == wildcards.db]["db_path"].values[0],
+        map_opts=" ".join(config["mapping_params"])
+    log:
+        "logs/mapping/{sample}_{library}.{db}_mapped.log"
+    benchmark:
+        "benchmarks/mapping/{sample}_{library}.{db}_mapped.txt"
+    threads: 4
+    shell:
+        """
+        (bowtie2 -x {params.index} -U {input} {params.map_opts} --threads {threads} | samtools view -b --threads {threads} | samtools sort --threads {threads} | samtools rmdup -s -  {output.dedup}) 2> {log}
+        ({METADMG_CPP}/misc/compressbam --threads {threads} --input {output.dedup} --output {output.comp} ) 2>> {log}
+        """
+
+# Merge all BAM files per sample into a single BAM file
+rule merge:
+    input:
+        lambda wildcards: expand("holi_mapped/{sample}_{library}.{db}.comp.bam",
+                                 sample=[wildcards.sample],
+                                 library=samples[samples["sample_id"] == wildcards.sample]["library_id"].unique(),
+                                 db=databases["db_name"].unique())
+    output:
+        bam="holi_merged/{sample}.merged.bam",
+        sort="holi_merged/{sample}.sorted.bam",
+    log:
+        "logs/merge/{sample}.log"
+    benchmark:
+        "benchmarks/merge/{sample}.txt"
+    threads:
+        10
+    shell:
+        """
+        # Merge all bam files 
+        (samtools merge --verbosity 5 --threads {threads} {output.bam} {input}) 2> {log}
+        # Sort the bam file
+        (samtools sort -o {output.sort} --threads {threads} {output.bam} ) 2>> {log}
+        """
+
+rule refine_bam:
+    input:
+        final="holi_merged/{sample}.sorted.bam",
+    output:
+        bam="holi_reassign/{sample}.reassign.bam"
+    log:
+        "logs/refine/{sample}.log"
+    benchmark:
+        "benchmarks/refine/{sample}.txt"
+    threads:
+        10
+    shell:
+        """
+        (filterBAM reassign --bam {input.final} --threads {threads} --iters 0 --min-read-ani 92 -M 250G -m 50G -n 3 --out-bam {output.bam}) 2> {log}
+        """
+
+rule filter_bam:
+    input:
+        bam="holi_reassign/{sample}.reassign.bam"
+    output:
+        filter="holi_filtered/{sample}.filtered.bam",
+        stats="holi_filtered/{sample}.stats.tsv.gz",
+        stats_filtered="holi_filtered/{sample}.stats-filtered.tsv.gz"
+    log:
+        "logs/filter/{sample}.log"
+    benchmark:
+        "benchmarks/filter/{sample}.txt"
+    threads:
+        10
+    shell:
+        """
+        (filterBAM filter --tmp-dir {TMP_DIR} --bam {input.bam} --bam-filtered {output.filter} --stats {output.stats} --stats-filtered {output.stats_filtered} --threads {threads} --min-read-ani 92 --min-normalized-entropy 0.6 -m 50G -n 10 -a 95 -N ) 2> {log}
+        """
+
+rule lca:
+    input:
+        bam="holi_filtered/{sample}.filtered.bam"
+    output:
+        bdamge="holi_lca/{sample}.bam.bdamage.gz",
+        lca="holi_lca/{sample}.bam.lca.gz",
+        stat="holi_lca/{sample}.bam.stat.gz",
+        wlca="holi_lca/{sample}.bam.rlens.gz"
+    params:
+        prefix="{sample}.bam"
+    log:
+        "logs/lca/{sample}.log"
+    benchmark:
+        "benchmarks/lca/{sample}.txt"
+    threads:
+        10
+    shell:
+        """
+        ({METADMG_CPP}/metaDMG-cpp lca --names {NAMES} --nodes {NODES} --acc2tax {ACC2TAX} --sim_score_low 0.95 --sim_score_high 1.0 --how_many 30 --weight_type 1 --threads {threads} --bam {input} --out_prefix holi_lca/{params.prefix}) 2> {log}
+        """
+
+rule dfit:
+    input:
+        bdamge="holi_lca/{sample}.bam.bdamage.gz",
+    output:
+        dfit="holi_dfit/{sample}.bam.dfit.gz"
+    log:
+        "logs/dfit/{sample}.log"
+    benchmark:
+        "benchmarks/dfit/{sample}.txt"
+    threads:
+        10
+    params:
+        strandness=lambda wildcards: get_strandness(wildcards.sample),
+        prefix="{sample}.bam"
+    shell:
+         """
+         ({METADMG_CPP}/metaDMG-cpp dfit {input.bdamge} --names {NAMES} --nodes {NODES} --showfits 2  --lib {params.strandness} --out holi_dfit/{params.prefix} ) 2> {log}
+         """
+
+rule metadmg_aggregate:
+    input:
+        bdamge="holi_lca/{sample}.bam.bdamage.gz",
+        dfit="holi_dfit/{sample}.bam.dfit.gz",
+        lca="holi_lca/{sample}.bam.stat.gz"
+    output:
+        stat="holi_aggregate/{sample}.bam.stat.gz"
+    log:
+        "logs/aggregate/{sample}.log"
+    benchmark:
+        "benchmarks/aggregate/{sample}.txt"
+    threads:
+         10
+    params:
+         prefix="holi_aggregate/{sample}.bam"
+    shell:
+         """
+         ({METADMG_CPP}/metaDMG-cpp aggregate {input.bdamge} --lcastat {input.lca} --names {NAMES} --nodes {NODES} --out {params.prefix} ) 2> {log}
+         """
+

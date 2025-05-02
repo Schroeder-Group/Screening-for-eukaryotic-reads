@@ -1,0 +1,16 @@
+database_file: "databases.txt"
+sample_file: "Input.tsv"
+gtdb_db: "/datasets/globe_databases/gtdb-hires/20220515/gtdb-r202-organelles-viruses-hires"
+gtdb_names: "/datasets/globe_databases/gtdb-hires/20220515/names.dmp"
+gtdb_nodes: "/datasets/globe_databases/gtdb-hires/20220515/nodes.dmp"
+gtdb_acc2tax: "/datasets/globe_databases/gtdb-hires/20220515/acc2.taxid.renamed.map.gz"
+tmp_dir: "/projects/schroeder_group/scratch/hsf378/tmp/Holi"
+ref-len: "reference_length.tsv"
+metaDMG-cpp: "/home/hsf378/schroeder/bin/metaDMG-cpp"
+names: "/datasets/globe_databases/holi_db/ncbitaxtaxjan2024/names.dmp"
+nodes: "/datasets/globe_databases/holi_db/ncbitaxtaxjan2024/nodes.dmp"
+acc2tax: "/datasets/globe_databases/holi_db/ncbitaxtaxjan2024/combinedAcc2taxaIDjan2024.gz"
+mapping_params:
+  - "--no-unal"
+  - "-k 1000"
+
