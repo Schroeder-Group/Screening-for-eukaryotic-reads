@@ -17,8 +17,8 @@ This Snakemake pipeline is mainly adapted from HOLI workflow (https://github.com
   - snakemake
   - bowtie2/2.5.2
   - samtools/1.21
-  - filterBAM
-  - metaDMG-cpp
+  - filterBAM (https://github.com/genomewalker/bam-filter)
+  - metaDMG-cpp (https://github.com/metaDMG-dev/metaDMG-cpp)
 ## Input data structure
 |SampleID|LibraryID|Strandness|fastq_file|
 | ------ | ------- | -------- | -------- |
