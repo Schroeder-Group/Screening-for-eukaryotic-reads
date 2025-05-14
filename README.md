@@ -18,6 +18,12 @@ This Snakemake pipeline is mainly adapted from HOLI workflow (https://github.com
   - bowtie2/2.5.2
   - samtools/1.21
   - filterBAM (https://github.com/genomewalker/bam-filter)
+    ```
+    wget https://raw.githubusercontent.com/genomewalker/bam-filter/master/environment.yml
+    conda env create -f environment.yml
+    conda activate bamfilter-faster
+    pip install git+https://github.com/genomewalker/bam-filter.git@faster-filter
+    ```
   - metaDMG-cpp (https://github.com/metaDMG-dev/metaDMG-cpp)
 ## Input data structure
 |SampleID|LibraryID|Strandness|fastq_file|
